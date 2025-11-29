@@ -49,7 +49,7 @@ IP   = "192.168.10.250"  # your TCP server IP
 PORT = 8080             # your TCP server port
 
 # Test generator settings
-iTestMsgCount = 50
+iTestMsgCount = 100
 testMsgLength = 1
 
 # Rate control config
@@ -607,7 +607,7 @@ async def uart_reader_loop(recv_q, sreader):
                 await asyncio.sleep_ms(1)
                 continue
 
-            print("client received: " + str(chunk))
+#            print("client received: " + str(chunk))
             buf += chunk
             s = buf.decode()
 
@@ -640,14 +640,14 @@ async def uart_reader_loop(recv_q, sreader):
                     line = buf[:i]
                     buf = buf[i+2:]  # drop CRLF
                     
-                    print('buf: ', buf)
-                    print('line: ', line)                                
+              #      print('buf: ', buf)
+               #     print('line: ', line)                                
 
                     if not line:
                         continue
 
                     # Debug (optional): print raw lines
-                    print('[UART]', line)
+#                    print('[UART]', line)
 
                     # ---- AT token checks ----
                     if b'OK' in line:
@@ -664,6 +664,26 @@ async def uart_reader_loop(recv_q, sreader):
                         
                     if b'ALREADY CONNECTED' in line:
                         _maybe_set('ALREADY CONNECTED')
+
+                    # Transparent-mode payloads: try JSON parse when braces present
+                    try:
+                        s_line = line.decode()
+                    except:
+                        s_line = line.decode(errors='ignore')
+
+                    jstart = s_line.find('{')
+                    jend = s_line.rfind('}')
+                    if jstart != -1 and jend != -1 and jend > jstart:
+                        try:
+                            jtext = s_line[jstart:jend+1]
+                            msg = ujson.loads(jtext)
+                            await recv_q.put(msg)
+                            print('parsed JSON:', jtext)
+                        except Exception as ex:
+                            try:
+                                print('json parse error:', ex)
+                            except:
+                                pass
         except Exception as ex:
             # Avoid crashing reader; log and continue
             try:

@@ -446,19 +446,47 @@ async def json_line_reader_stream(
                 if not chunk:
                     continue
 
+                # parse link id and payload
+                # expected format: "+IPD,<id>,<len>:<payload>"
+                # after split, chunk starts with ",<id>,<len>:..." or full header
+                # normalize to ensure parsing works
+                if not chunk.startswith(",") and not chunk.startswith("+IPD"):
+                    # ensure we have a leading comma before id
+                    pass
+
+                # find separators
+                try:
+                    # find first comma after optional prefix
+                    p_id_start = chunk.find(",")
+                    if p_id_start == -1:
+                        continue
+                    p_id_end = chunk.find(",", p_id_start + 1)
+                    if p_id_end == -1:
+                        continue
+                    p_len_end = chunk.find(":", p_id_end + 1)
+                    if p_len_end == -1:
+                        continue
+                    link_id_str = chunk[p_id_start+1:p_id_end]
+                    link_id = int(link_id_str)
+                    # payload begins after ':'
+                    payload_str = chunk[p_len_end+1:]
+                except Exception:
+                    continue
+
                 # find start of JSON
-                idx = chunk.find("{")
+                idx = payload_str.find("{")
                 
                 if idx == -1:
                     continue
 
-                json_str = chunk[idx:]
+                json_str = payload_str[idx:]
 
                 # Decide JSON vs text
                 if json_predicate(json_str):
                     try:
                         msg = json.loads(json_str)
-                        await recv_q.put(msg)                                                    
+                        # include link_id so responders can reply to same connection
+                        await recv_q.put((link_id, msg))                                                    
                         continue
                     except Exception:
                         # Fall through to on_text if parse fails
@@ -488,18 +516,30 @@ async def json_line_reader_stream(
 # The higher-level app should place properly formatted CIP commands into send_q.
 async def sender_loop(send_q):
     while True:
-        data = await send_q.get()
+        item = await send_q.get()
         
         try:
+            # item is expected to be (link_id, data)
+            if isinstance(item, tuple) and len(item) == 2:
+                link_id, data = item
+            else:
+                # fallback: default link 0
+                link_id = 0
+                data = item
+
             print('Data to send:')
             print(str(data))
-            link_id = 0
 
-            cmd = f'AT+CIPSEND={link_id},{len(data)}'
-            ok = await send_at(cmd, expect=('OK',), timeout_ms=4000)
+            # prepare payload with CRLF so client can split lines
+            payload = data if isinstance(data, (bytes, bytearray)) else data.encode('utf-8')
+            payload += b'\r\n'
+
+            cmd = f'AT+CIPSEND={link_id},{len(payload)}'
+            # expect prompt '>' for data send
+            ok = await send_at(cmd, expect=('>','OK'), timeout_ms=5000)
             
             if ok:
-                await swriter.awrite(data)  # no extra '\n' unless you want it
+                await swriter.awrite(payload)
 
             print('Msg sent OK...\r')
         except Exception as ex:
@@ -508,23 +548,23 @@ async def sender_loop(send_q):
 # -------------- Simple dispatcher for +IPD lines --------------
 async def recv_queue_processor(recv_q, send_q):
     while True:
-        msg = await recv_q.get()
+        link_id, msg = await recv_q.get()
         
         category = msg["Category"]        
 
         if category == 'Files':
-            await handle_files(msg)
+            await handle_files(link_id, msg, send_q)
         elif category == 'Test':
-            await handle_test(msg, send_q)
+            await handle_test(link_id, msg, send_q)
         else:
-            print('RX:', obj)
+            print('RX:', msg)
 
 # -------- Concrete Handlers (ported) --------
 # Files: 3-step protocol: Header -> Content -> End
 #   Header: {'Category':'Files','Step':'Header','FileName': 'name.ext'}
 #   Content: {'Category':'Files','Step':'Content','FileName': 'name.ext','FileData': base64,'ProgressPercentage': n,'FileBlockSequenceNumber': n}
 #   End: {'Category':'Files','Step':'End','FileName': 'name.ext','HashData': base64_of_sha256}
-async def handle_files(msg, send_queue):
+async def handle_files(link_id, msg, send_queue):
     global _in_hash_md5, fout
     step = msg.get('Step')
     try:
@@ -566,12 +606,12 @@ async def handle_files(msg, send_queue):
             error_q.append('Files: unknown step')
     finally:
         try:
-            await send_queue.put(ujson.dumps(msg))
+            await send_queue.put((link_id, ujson.dumps(msg)))
         except Exception as ex:
             error_q.append('Files send_queue error: %s' % ex)
 
 # Test: verify hash of Base64Message and respond with echoed payload + its hash
-async def handle_test(msg, send_queue):
+async def handle_test(link_id, msg, send_queue):
     print('Test Category...')
     
     try:
@@ -608,7 +648,7 @@ async def handle_test(msg, send_queue):
             'RspReceivedOK': True,
         }
         
-        await send_queue.put(ujson.dumps(rsp))
+        await send_queue.put((link_id, ujson.dumps(rsp)))
     except Exception as ex:
         error_q.append('Test handler error: %s' % ex)
 
