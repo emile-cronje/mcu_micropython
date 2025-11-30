@@ -1,0 +1,9 @@
+This patch switches the client from transparent mode to normal mode with AT+CIPSEND flow control.
+
+Key changes:
+1. Remove CIPMODE=1 setup - stay in normal mode
+2. Update sender() to use AT+CIPSEND for each message with proper '>' and 'SEND OK' synchronization
+3. Remove transparent mode fallback logic
+
+Files changed:
+- uart_tcp_client.py: start_client(), sender()

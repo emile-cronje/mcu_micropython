@@ -50,8 +50,9 @@ IP   = "192.168.10.250"  # your TCP server IP
 PORT = 8080             # your TCP server port
 
 # Test generator settings
-iTestMsgCount = 100
+iTestMsgCount = 2
 testMsgLength = 1
+BATCH_SIZE = 2
 
 # Rate control config
 BYTES_PER_SEC      = 2048   # throttle raw throughput (0 = unlimited)
@@ -81,6 +82,10 @@ CONSEC_FAILS = [0]
 WATCHDOG_ENABLED = [True]
 CANDIDATE_UARTS = [0, 1, 2]          # try what your board supports
 CANDIDATE_BAUDS = [115200, 9600, 230400, 57600]  # common ESP-AT bauds
+
+# Batch processing state
+batch_processed = {}  # {batch_num: {msgId: processed_bool}}
+batch_complete_events = {}  # {batch_num: asyncio.Event}
 
 # Token buckets and locks initialized later (after uart)
 byte_bucket = None
@@ -446,6 +451,22 @@ async def send_at(cmd: str,
     return ok
 
 # -----------------------------
+# Normal mode helpers
+# -----------------------------
+async def wait_token(token: str, timeout_ms=3000) -> bool:
+    """Wait for a specific token from the UART reader without sending a command."""
+    evt = asyncio.Event()
+    _pending[token] = evt
+    
+    try:
+        await asyncio.wait_for(evt.wait(), timeout_ms/1000)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        _pending.pop(token, None)
+
+# -----------------------------
 # Transparent helpers
 # -----------------------------
 async def reopen_transparent_stream(ip, port, verbose=True):
@@ -523,15 +544,15 @@ async def start_client(ssid, pwd, ip, port, verbose=True):
     await asyncio.sleep_ms(1200)
     await _drain_uart_once(80)  # clear any stale data
 
-    """Bring up Wi-Fi and open TCP link; prefer transparent mode if possible."""
+    """Bring up Wi-Fi and open TCP link; use normal mode for reliable AT+CIPSEND flow control."""
     steps = [
         ('AT', ('OK',)),
         ('ATE0', ('OK',)),  # disable echo
         ('AT+CWMODE=3', ('OK',)),
         ('AT+CWJAP="%s","%s"' % (ssid, pwd), ('OK','ALREADY CONNECTED','FAIL')),
         ('AT+CIFSR', ('OK',)),
+        ('AT+CIPMUX=0', ('OK',)),  # Single connection mode
         ('AT+CIPSTART="TCP","%s",%s' % (ip, port), ('OK','ALREADY CONNECTED','ERROR')),
-        ('AT+CIPMODE=1', ('OK',)),
     ]
     for cmd, expect in steps:
         ok = await send_at(cmd, expect=expect, timeout_ms=20000 if 'CWJAP' in cmd else 8000, verbose=verbose)
@@ -547,18 +568,9 @@ async def start_client(ssid, pwd, ip, port, verbose=True):
         
         await asyncio.sleep_ms(50)
 
-    ok = await send_at('AT+CIPMODE?', expect=(':1',), timeout_ms=3000, verbose=verbose)
-    TRANSPARENT_MODE[0] = bool(ok)
-    
-    if TRANSPARENT_MODE[0]:
-        ok = await send_at('AT+CIPSEND', expect=('OK',), timeout_ms=4000, verbose=verbose)
-        TRANSPARENT_READY[0] = bool(ok)
-        
-        if not ok and verbose:
-            print('CIPSEND did not return "OK" — transparent stream not ready')
-            return False
-    else:
-        TRANSPARENT_READY[0] = False
+    # Stay in normal mode - no CIPMODE=1
+    TRANSPARENT_MODE[0] = False
+    TRANSPARENT_READY[0] = False
 
     return True
 
@@ -567,7 +579,7 @@ async def start_client(ssid, pwd, ip, port, verbose=True):
 # -----------------------------
 async def sender(msg_q, swriter):
     global send_sem
-    print('sender start...')
+    print('sender start (normal mode)...')
     
     while True:
         msg = await msg_q.get()
@@ -578,22 +590,37 @@ async def sender(msg_q, swriter):
             else:
                 payload, msgId = msg, None
 
-            wire_len = len(payload) + 1  # +1 for '\n'
+            # Encode payload with newline
+            if isinstance(payload, str):
+                payload_bytes = payload.encode() + b'\n'
+            else:
+                payload_bytes = payload + b'\n'
 
             async with send_sem:
                 await msg_bucket.consume(1)
 
-                if TRANSPARENT_MODE[0] and TRANSPARENT_READY[0]:
-                    await byte_bucket.consume(wire_len)
+                # Normal mode: AT+CIPSEND=<length>
+                cmd = 'AT+CIPSEND=%d' % len(payload_bytes)
+                ok = await send_at(cmd, expect=('>',), timeout_ms=5000, verbose=False)
+                
+                if not ok:
+                    print('AT+CIPSEND failed for msgId:', msgId)
+                    continue
+                
+                # Send the payload after receiving '>'
+                await swriter.awrite(payload_bytes)
+                LAST_TX_MS[0] = time.ticks_ms()
+                
+                # Wait for SEND OK
+                ok = await wait_token('SEND OK', timeout_ms=5000)
+                
+                if ok:
+                    print('Send OK (normal) msgId:', msgId)
+                else:
+                    print('SEND OK timeout for msgId:', msgId)
                     
-                    #print('sending payload (transparent)...', payload)
-                    
-                    await swriter.awrite(payload + '\n')
-                    
-                    LAST_TX_MS[0] = time.ticks_ms()
-                    print('Send OK (transparent)')
         except Exception as ex:
-            print("sender error: ", ex)
+            print("sender error:", ex)
 
 async def msgCompare(recv_q, test_dict):
     while True:
@@ -610,19 +637,25 @@ async def msgCompare(recv_q, test_dict):
         if b64_in != b64_out:
             err = 'test msg diff'
             print(err)
-#            print('b64_in: ' + str(b64_in))
- #           print('b64_hash_in: ' + str(b64_hash_in))                        
-#            error_q.append(err)
         elif b64_hash_in != b64_hash_out:
             err = 'test msg hash diff'
             print(err)
-#            print('b64_in: ' + str(b64_in))
- #           print('b64_hash_in: ' + str(b64_hash_in))                        
-#            error_q.append(err)
         else:
             print("Matched OK: " + str(msgId))
         
-        await asyncio.sleep_ms(100)        
+        # Mark message as processed and check if batch is complete
+        for batch_num, msg_dict in batch_processed.items():
+            if msgId in msg_dict:
+                msg_dict[msgId] = True
+                # Check if all messages in this batch are processed
+                if all(msg_dict.values()):
+                    print("Batch %d fully processed!" % batch_num)
+                    event = batch_complete_events.get(batch_num)
+                    if event:
+                        event.set()
+                break
+        
+        await asyncio.sleep_ms(10)
     
 async def uart_reader_loop(recv_q, sreader):
     """Sole consumer of UART input. Splits CRLF. Routes +IPD to recv_q, resolves AT tokens."""
@@ -646,12 +679,11 @@ async def uart_reader_loop(recv_q, sreader):
 #            print(chunk)
             LAST_RX_MS[0] = time.ticks_ms()
             buf += chunk
+            # Best-effort decode for parsing; keep raw buf for byte scanning
             try:
                 s = buf.decode()
             except:
-                # Skip invalid UTF-8, keep buffer as-is for now
-                await asyncio.sleep_ms(10)
-                continue
+                s = None
 
             if (s.find('+IPD') >= 0):
                 n1 = s.find('+IPD,')
@@ -673,60 +705,95 @@ async def uart_reader_loop(recv_q, sreader):
                 msg = ujson.loads(s)                
                 await recv_q.put(msg)                
             else:
-                while True:
+                # First, consume any CRLF-delimited lines for AT tokens and potential JSON
+                progressed = True
+                while progressed:
+                    progressed = False
                     i = buf.find(b'\r\n')
-                    
-                    if i < 0:
-                        break
-                    
-                    line = buf[:i]
-                    buf = buf[i+2:]  # drop CRLF
-                    
-                    #print('buf: ', buf)
-                    #print('line: ', line)                                
-
-                    if not line:
-                        continue
-
-                    # Debug (optional): print raw lines
-                    #print('[UART]', line)
-
-                    # ---- AT token checks ----
-                    if b'OK' in line:
-                        _maybe_set('OK')
-                        
-                    if b'>' in line:
-                        _maybe_set('>')
-                        
-                    if b'ERROR' in line:
-                        _maybe_set('ERROR')
-                        
-                    if b'FAIL' in line:
-                        _maybe_set('FAIL')
-                        
-                    if b'ALREADY CONNECTED' in line:
-                        _maybe_set('ALREADY CONNECTED')
-
-                    # Transparent-mode payloads: try JSON parse when braces present
-                    try:
-                        s_line = line.decode()
-                    except:
-                        # Skip lines with invalid UTF-8
-                        continue
-
-                    jstart = s_line.find('{')
-                    jend = s_line.rfind('}')
-                    if jstart != -1 and jend != -1 and jend > jstart:
+                    if i >= 0:
+                        line = buf[:i]
+                        buf = buf[i+2:]
+                        progressed = True
+                        if not line:
+                            continue
+                        # AT tokens
+                        if b'OK' in line:
+                            _maybe_set('OK')
+                        if b'>' in line:
+                            _maybe_set('>')
+                        if b'ERROR' in line:
+                            _maybe_set('ERROR')
+                        if b'FAIL' in line:
+                            _maybe_set('FAIL')
+                        if b'ALREADY CONNECTED' in line:
+                            _maybe_set('ALREADY CONNECTED')
+                        # JSON on this line
                         try:
-                            jtext = s_line[jstart:jend+1]
-                            msg = ujson.loads(jtext)
-                            await recv_q.put(msg)
-                            #print('parsed JSON:', jtext)
-                        except Exception as ex:
-                            try:
-                                print('json parse error:', ex)
-                            except:
-                                pass
+                            s_line = line.decode()
+                        except:
+                            s_line = None
+                        if s_line:
+                            jstart = s_line.find('{')
+                            jend = s_line.rfind('}')
+                            if jstart != -1 and jend != -1 and jend > jstart:
+                                try:
+                                    jtext = s_line[jstart:jend+1]
+                                    msg = ujson.loads(jtext)
+                                    await recv_q.put(msg)
+                                except Exception as ex:
+                                    try:
+                                        print('json parse error:', ex)
+                                    except:
+                                        pass
+                
+                # Next, handle JSON that may arrive without CRLF by scanning braces in the raw buffer
+                # Convert bytes to string for scanning but retain original buf for slicing
+                if s is None:
+                    try:
+                        s = buf.decode()
+                    except:
+                        s = ''
+                # Extract contiguous JSON objects repeatedly
+                while True:
+                    jstart = s.find('{')
+                    jend = s.find('}', jstart + 1)
+                    if jstart == -1 or jend == -1:
+                        break
+                    # Expand jend to the last closing brace for nested braces (simple heuristic)
+                    # Find matching closing by counting
+                    depth = 0
+                    end_idx = -1
+                    for idx, ch in enumerate(s[jstart:], start=jstart):
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                            if depth == 0:
+                                end_idx = idx
+                                break
+                    if end_idx == -1:
+                        break
+                    jtext = s[jstart:end_idx+1]
+                    # Push JSON
+                    try:
+                        msg = ujson.loads(jtext)
+                        await recv_q.put(msg)
+                    except Exception as ex:
+                        try:
+                            print('json parse error (buffer):', ex)
+                        except:
+                            pass
+                    # Remove consumed segment from both s and buf
+                    # Compute byte indices by re-encoding the segment
+                    consumed_bytes = jtext.encode()
+                    pos_bytes = buf.find(consumed_bytes)
+                    if pos_bytes != -1:
+                        buf = buf[pos_bytes + len(consumed_bytes):]
+                    # Update s to reflect new buf
+                    try:
+                        s = buf.decode()
+                    except:
+                        s = ''
         except Exception as ex:
             # Avoid crashing reader; log and continue
             try:
@@ -781,15 +848,48 @@ async def testMsgGenerator(msg_q, test_dict):
             TRANSPARENT_MODE[0] = False
             TRANSPARENT_READY[0] = False
 
+    batch_num = 1
     while icounter <= iTestMsgCount:
-        msg = ("Hello World !!! %d\r\n" % icounter) * testMsgLength
-        msg_json, msgId = buildTestMsg(msg)
+        print("Starting batch %d (messages %d-%d)" % (batch_num, icounter, min(icounter + BATCH_SIZE - 1, iTestMsgCount)))
         
-        await msg_q.put((msgId, msg_json))
-        test_dict[msgId] = msg_json
+        # Initialize batch tracking
+        batch_complete_events[batch_num] = asyncio.Event()
+        batch_processed[batch_num] = {}
         
-        icounter += 1
-        await asyncio.sleep_ms(500)  # Increased from 50ms to 500ms
+        # Send a batch of messages
+        batch_end = min(icounter + BATCH_SIZE, iTestMsgCount + 1)
+        for i in range(icounter, batch_end):
+            msg = ("Hello World !!! %d\r\n" % i) * testMsgLength
+            msg_json, msgId = buildTestMsg(msg)
+            
+            await msg_q.put((msgId, msg_json))
+            test_dict[msgId] = msg_json
+            batch_processed[batch_num][msgId] = False  # Track this message in the batch
+            
+            await asyncio.sleep_ms(50)  # Small delay between messages in same batch
+        
+        print("Batch %d queued, waiting for processing..." % batch_num)
+        
+        # Wait for all messages in this batch to be processed
+        try:
+            await asyncio.wait_for(batch_complete_events[batch_num].wait(), 30)  # 30 second timeout
+            print("Batch %d complete" % batch_num)
+        except asyncio.TimeoutError:
+            print("Batch %d timeout! Some messages may not have been processed." % batch_num)
+        
+        # Clean up this batch's tracking data
+        del batch_complete_events[batch_num]
+        del batch_processed[batch_num]
+        
+        icounter = batch_end
+        
+        # Wait before next batch
+        if icounter <= iTestMsgCount:
+            print("Waiting before next batch...")
+            await asyncio.sleep_ms(1000)
+            batch_num += 1
+        else:
+            print("All %d messages queued and processed" % iTestMsgCount)
 
 # -----------------------------
 # Watchdog (optional hard reset)

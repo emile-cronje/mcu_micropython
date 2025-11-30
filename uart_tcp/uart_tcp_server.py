@@ -149,6 +149,18 @@ async def send_at(cmd: str, expect=('OK',), timeout_ms=5000) -> bool:
             for t in expect:
                 _pending.pop(t, None)
 
+async def wait_token(token: str, timeout_ms=3000) -> bool:
+    """Wait for a UART line containing the given token without sending any AT command."""
+    evt = asyncio.Event()
+    _pending[token] = evt
+    try:
+        await asyncio.wait_for(evt.wait(), timeout_ms/1000)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        _pending.pop(token, None)
+
 async def start_tcp_server_static_sta(ssid, pwd,
                                       ip="192.168.1.50",
                                       gw="192.168.1.1",
@@ -435,6 +447,9 @@ async def json_line_reader_stream(
             if b'ALREADY CONNECTED' in line:
                 _maybe_set('ALREADY CONNECTED')
 
+            if b'SEND OK' in line:
+                _maybe_set('SEND OK')
+
 # -------------- Example "sender" (raw TCP writes) --------------
 # You will still need to wrap messages with CIPSend/CIPSENDEX for a specific connection id.
 # The higher-level app should place properly formatted CIP commands into send_q.
@@ -460,10 +475,12 @@ async def sender_loop(send_q):
 
             cmd = f'AT+CIPSEND={link_id},{len(payload)}'
             # expect prompt '>' for data send
-            ok = await send_at(cmd, expect=('>','OK'), timeout_ms=5000)
+            ok = await send_at(cmd, expect=('>',), timeout_ms=5000)
             
             if ok:
                 await swriter.awrite(payload)
+                # Pace on SEND OK to enforce strict framing (no extra AT)
+                await wait_token('SEND OK', timeout_ms=5000)
 
             print('Msg sent OK...\r')
         except Exception as ex:
