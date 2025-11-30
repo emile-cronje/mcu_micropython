@@ -16,7 +16,6 @@ SSID = 'Cudy24G'         # <-- change if needed
 PASSWORD = 'ZAnne19991214'
 PORT = '8080'
 UART_ID = 0
-MQTT_BROKER = '192.168.10.124'
 BAUD = 115200
 TX_PIN = None  # Use default pins for UART(0) on your board
 RX_PIN = None
@@ -38,30 +37,6 @@ _pending = {}  # e.g. {'OK': Future, '>': Future, 'ERROR': Future}
 recv_q = Queue()  # inbound app payloads (e.g. from +IPD)
 send_q = Queue()  # outbound app payloads (raw TCP writes)
 _at_lock = asyncio.Lock()
-
-#mqtt helpers
-# ---- MQTT packet builders (CONNECT / PUBLISH QoS0 / PINGREQ) ----
-
-def _enc_varint(n: int) -> bytes:
-    # MQTT Remaining Length varint
-    out = bytearray()
-    while True:
-        byte = n % 128
-        n //= 128
-        if n > 0:
-            byte |= 0x80
-        out.append(byte)
-        if n == 0:
-            break
-    return bytes(out)
-
-def _enc_utf8(s: str) -> bytes:
-    b = s.encode('utf-8')
-    return len(b).to_bytes(2, 'big') + b
-
-
-# Minimal AT helpers if you don't already have them:
-
 uart = UART(1, 115200)
 uart.read()
 
@@ -143,53 +118,6 @@ def _extract_ipd_frames(accum: bytearray):
         del accum[:c+1+length]
         out.append(payload)
     return out
-
-async def wait_connack(timeout_ms=5000):
-    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
-    accum = bytearray()
-    while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-        if uart.any():
-            accum += uart.read() or b""
-            # If normal mode, peel +IPD frames to get raw MQTT
-            if not TRANSPARENT_MODE[0]:
-                for pl in _extract_ipd_frames(accum):
-                    if pl.startswith(b'\x20\x02'):  # CONNACK, remaining length 2
-                        # pl = 0x20 0x02 [ack flags] [return code]
-                        return pl[3] == 0  # return code 0 = success
-            else:
-                # Transparent: look directly for CONNACK
-                i = accum.find(b'\x20\x02')
-                if i >= 0 and len(accum) >= i+4:
-                    return accum[i+3] == 0
-        await asyncio.sleep_ms(10)
-    return False
-
-async def mqtt_connect_session(client_id, keepalive=30, user="", pwd=""):
-    pkt = mqtt_connect_pkt(client_id, keepalive, user, pwd, clean=True)
-    ok  = await tcp_send(pkt)
-    if not ok: return False
-    ok  = await wait_connack()
-    return ok
-
-async def mqtt_publish_qos0(topic: str, payload: str | bytes, retain=False):
-    pkt = mqtt_publish_qos0_pkt(topic, payload, retain=retain)
-    return await tcp_send(pkt)
-
-async def mqtt_ping( ) -> bool:
-    return await tcp_send(mqtt_pingreq_pkt())
-
-async def mqtt_connect(broker, port=1883, client_id="pico", user="", pwd="", ssl=False):
-    scheme = 2 if ssl else 1
-    ok  = await send_at(f'AT+MQTTUSERCFG=0,{scheme},"{client_id}","{user}","{pwd}",0,0,""', expect=('OK',))
-    ok &= await send_at(f'AT+MQTTCONN=0,"{broker}",{port},{1 if ssl else 0}', expect=('OK','ALREADY CONNECTED'))
-    return bool(ok)
-
-async def mqtt_pub(topic, payload, qos=0, retain=0):
-    # payload must be a simple string; escape quotes if needed
-    return await send_at(f'AT+MQTTPUB=0,"{topic}","{payload}",{qos},{retain}', expect=('OK',))
-
-async def mqtt_sub(topic, qos=0):
-    return await send_at(f'AT+MQTTSUB=0,"{topic}",{qos}', expect=('OK',))
 
 def _maybe_set(token: str):
     evt = _pending.get(token)
@@ -273,11 +201,7 @@ async def start_tcp_server_static_sta(ssid, pwd,
 
     ok &= await send_at('AT+CIPSTART=%d,"TCP","%s",%d' % (4, "192.168.10.174", 1883),
                         expect=('OK','ALREADY CONNECTED'), timeout_ms=8000)
-    if not ok:
-        print("Bring-up failed")
-    else:
-        print("TCP server on %d, MQTT link id %d to %s:%d" % (1883, 4, "192.168.10.174", 1883))
-
+    
     return True
 
 async def start_esp_server(ssid: str, pwd: str, port: str = '8080') -> bool:
@@ -425,7 +349,7 @@ async def json_line_reader_stream(
 
         try:
             text = line.decode(encoding)
-            print("json_line_reader_stream:  " + str(text))            
+            #print("json_line_reader_stream:  " + str(text))            
         except Exception as ex:
             # Fallback: best-effort replacement chars
             text = line.decode(encoding, 'ignore')
@@ -659,6 +583,19 @@ async def heartbeat():
         await asyncio.sleep_ms(500)
         led(not led())
 
+async def showMemUsage():
+    while True:
+        print(free(True))
+        await asyncio.sleep(5)
+
+def free(full=False):
+    F = gc.mem_free()
+    A = gc.mem_alloc()
+    T = F+A
+    P = '{0:.2f}%'.format(F/T*100)
+    if not full: return P
+    else : return ('Total:{0} Free:{1} ({2})'.format(T,F,P))
+
 # -------------- Orchestration --------------
 async def main():
        
@@ -666,17 +603,14 @@ async def main():
     reader_task = asyncio.create_task(json_line_reader_stream(recv_q, sreader))    
     sender_task = asyncio.create_task(sender_loop(send_q))
     queue_processor_task = asyncio.create_task(recv_queue_processor(recv_q, send_q))
-    asyncio.create_task(heartbeat())    
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(showMemUsage())        
 
     useStaticIP = True
     
     if (useStaticIP == False):
         ok = await start_esp_server(SSID, PASSWORD, PORT)
     else:
-        #mqtt
-        server = "192.168.10.250"
-        port = 1883
-        
         ok = await start_tcp_server_static_sta(
             ssid="Cudy24G",
             pwd="ZAnne19991214",
@@ -690,13 +624,6 @@ async def main():
         reader_task.cancel()
         sender_task.cancel()
         return
-
-#    mqttOK = await mqtt_connect(MQTT_BROKER)
-    
-    #if (mqttOK == True):
-        #print("MQTT OK...")
-    #else:
-     #   print("MQTT Failed...")        
 
     # Example: periodically print free mem
     async def monitor():

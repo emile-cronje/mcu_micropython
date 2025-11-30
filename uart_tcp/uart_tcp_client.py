@@ -19,6 +19,7 @@ from queue import Queue
 import ubinascii
 import uhashlib
 import ujson
+import gc
 
 try:
     from machine import UART, Pin
@@ -49,7 +50,7 @@ IP   = "192.168.10.250"  # your TCP server IP
 PORT = 8080             # your TCP server port
 
 # Test generator settings
-iTestMsgCount = 2
+iTestMsgCount = 100
 testMsgLength = 1
 
 # Rate control config
@@ -585,7 +586,7 @@ async def sender(msg_q, swriter):
                 if TRANSPARENT_MODE[0] and TRANSPARENT_READY[0]:
                     await byte_bucket.consume(wire_len)
                     
-                    print('sending payload (transparent)...', payload)
+                    #print('sending payload (transparent)...', payload)
                     
                     await swriter.awrite(payload + '\n')
                     
@@ -594,6 +595,35 @@ async def sender(msg_q, swriter):
         except Exception as ex:
             print("sender error: ", ex)
 
+async def msgCompare(recv_q, test_dict):
+    while True:
+        receivedMsg = await recv_q.get()
+        msgId = receivedMsg["Id"]
+        
+        b64_in = receivedMsg.get('Base64Message', '')
+        b64_hash_in = receivedMsg.get('Base64MessageHash', '')
+
+        sentMsg = ujson.loads(test_dict[msgId])
+        b64_out = sentMsg.get('Base64Message', '')
+        b64_hash_out = sentMsg.get('Base64MessageHash', '')
+        
+        if b64_in != b64_out:
+            err = 'test msg diff'
+            print(err)
+#            print('b64_in: ' + str(b64_in))
+ #           print('b64_hash_in: ' + str(b64_hash_in))                        
+#            error_q.append(err)
+        elif b64_hash_in != b64_hash_out:
+            err = 'test msg hash diff'
+            print(err)
+#            print('b64_in: ' + str(b64_in))
+ #           print('b64_hash_in: ' + str(b64_hash_in))                        
+#            error_q.append(err)
+        else:
+            print("Matched OK: " + str(msgId))
+        
+        await asyncio.sleep_ms(100)        
+    
 async def uart_reader_loop(recv_q, sreader):
     """Sole consumer of UART input. Splits CRLF. Routes +IPD to recv_q, resolves AT tokens."""
     global uart
@@ -613,7 +643,7 @@ async def uart_reader_loop(recv_q, sreader):
                 continue
 
             print("client received:")
-            print(chunk)
+#            print(chunk)
             LAST_RX_MS[0] = time.ticks_ms()
             buf += chunk
             try:
@@ -637,8 +667,8 @@ async def uart_reader_loop(recv_q, sreader):
                     s = s[json_open_tag_index:json_close_tag_index]
                     is_json = True
                 
-                print("Parsed data...\r\n")
-                print("ID= " + str(ID) + ", Data= " + s + '\r\n' + "IsJSON= " + str(is_json))
+#                print("Parsed data...\r\n")
+ #               print("ID= " + str(ID) + ", Data= " + s + '\r\n' + "IsJSON= " + str(is_json))
                 data_received_ok = True
                 msg = ujson.loads(s)                
                 await recv_q.put(msg)                
@@ -652,14 +682,14 @@ async def uart_reader_loop(recv_q, sreader):
                     line = buf[:i]
                     buf = buf[i+2:]  # drop CRLF
                     
-                    print('buf: ', buf)
-                    print('line: ', line)                                
+                    #print('buf: ', buf)
+                    #print('line: ', line)                                
 
                     if not line:
                         continue
 
                     # Debug (optional): print raw lines
-                    print('[UART]', line)
+                    #print('[UART]', line)
 
                     # ---- AT token checks ----
                     if b'OK' in line:
@@ -691,7 +721,7 @@ async def uart_reader_loop(recv_q, sreader):
                             jtext = s_line[jstart:jend+1]
                             msg = ujson.loads(jtext)
                             await recv_q.put(msg)
-                            print('parsed JSON:', jtext)
+                            #print('parsed JSON:', jtext)
                         except Exception as ex:
                             try:
                                 print('json parse error:', ex)
@@ -732,7 +762,7 @@ def buildTestMsg(msg_in):
     
     return msg_json, msgId
 
-async def testMsgGenerator(msg_q):
+async def testMsgGenerator(msg_q, test_dict):
     print("testMsgGenerator start...")
     icounter = 1
 
@@ -756,6 +786,7 @@ async def testMsgGenerator(msg_q):
         msg_json, msgId = buildTestMsg(msg)
         
         await msg_q.put((msgId, msg_json))
+        test_dict[msgId] = msg_json
         
         icounter += 1
         await asyncio.sleep_ms(500)  # Increased from 50ms to 500ms
@@ -889,6 +920,19 @@ def init_uart():
     cmd_lock = asyncio.Lock()
     send_sem = Semaphore(MAX_INFLIGHT_SENDS)
 
+async def showMemUsage():
+    while True:
+        print(free(True))
+        await asyncio.sleep(5)
+
+def free(full=False):
+    F = gc.mem_free()
+    A = gc.mem_alloc()
+    T = F+A
+    P = '{0:.2f}%'.format(F/T*100)
+    if not full: return P
+    else : return ('Total:{0} Free:{1} ({2})'.format(T,F,P))
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -940,12 +984,15 @@ async def main():
     swriter = asyncio.StreamWriter(uart, {})
     sreader = asyncio.StreamReader(uart)
     send_q = Queue()
-    recv_q = Queue()    
+    recv_q = Queue()
+    test_dict = {}
    
-    asyncio.create_task(testMsgGenerator(send_q))    
+    asyncio.create_task(testMsgGenerator(send_q, test_dict))    
     asyncio.create_task(sender(send_q, swriter))
     asyncio.create_task(uart_reader_loop(recv_q, sreader))
-    asyncio.create_task(link_watchdog(IP, PORT))    
+    asyncio.create_task(msgCompare(recv_q, test_dict))    
+    asyncio.create_task(link_watchdog(IP, PORT))
+    asyncio.create_task(showMemUsage())    
 
     # Keep the loop alive
     while True:
