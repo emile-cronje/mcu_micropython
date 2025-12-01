@@ -50,9 +50,9 @@ IP   = "192.168.10.250"  # your TCP server IP
 PORT = 8080             # your TCP server port
 
 # Test generator settings
-iTestMsgCount = 2
+iTestMsgCount = 50
 testMsgLength = 1
-BATCH_SIZE = 2
+BATCH_SIZE = 25
 # Rate control config
 BYTES_PER_SEC      = 2048   # throttle raw throughput (0 = unlimited)
 MSG_PER_SEC        = 10     # throttle number of messages/ATs (0 = unlimited)
@@ -584,6 +584,7 @@ async def start_client(ssid, pwd, ip, port, verbose=True):
 # -----------------------------
 async def sender(msg_q, swriter):
     global send_sem
+    global pending_ids, WINDOW_SIZE, msg_send_times, msg_retry_count
     print('sender start (normal mode)...')
     
     while True:
@@ -601,13 +602,20 @@ async def sender(msg_q, swriter):
             else:
                 payload_bytes = payload + b'\n'
 
+            # Flow control: wait until pending < WINDOW_SIZE
+            while len(pending_ids) >= WINDOW_SIZE:
+                await asyncio.sleep_ms(10)
+
             async with send_sem:
                 await msg_bucket.consume(1)
 
                 # Normal mode: AT+CIPSEND=<length>
                 # Use write_at_line instead of send_at to avoid competing UART readers
                 cmd = 'AT+CIPSEND=%d' % len(payload_bytes)
-                print('AT>>', cmd)
+                retry_info = ''
+                if msgId in msg_retry_count:
+                    retry_info = ' (retry %d/%d)' % (msg_retry_count[msgId], MAX_RETRIES)
+                print('AT>>', cmd, 'for msgId:', msgId, retry_info)
                 await write_at_line(cmd)
                 
                 # Wait for '>' prompt
@@ -628,6 +636,12 @@ async def sender(msg_q, swriter):
                 
                 if ok:
                     print('Send OK (normal) msgId:', msgId)
+                    if msgId is not None:
+                        pending_ids.add(msgId)
+                        msg_send_times[msgId] = time.ticks_ms()
+                        print('Tracking msgId:', msgId, 'sent at:', msg_send_times[msgId])
+                    # Small delay between sends to prevent ESP-AT frame corruption
+                    await asyncio.sleep_ms(15)
                 else:
                     print('SEND OK timeout for msgId:', msgId)
                     
@@ -635,9 +649,30 @@ async def sender(msg_q, swriter):
             print("sender error:", ex)
 
 async def msgCompare(recv_q, test_dict):
+    global msg_send_times
     while True:
         receivedMsg = await recv_q.get()
         msgId = receivedMsg["Id"]
+        
+        # Calculate round-trip time
+        rtt_ms = -1
+        if msgId in msg_send_times:
+            rtt_ms = time.ticks_diff(time.ticks_ms(), msg_send_times[msgId])
+            print("Response received for msgId:", msgId, "RTT:", rtt_ms, "ms")
+            del msg_send_times[msgId]
+        else:
+            print("Response received for msgId:", msgId, "(no send time tracked)")
+        
+        # Flow control: remove from pending window on server response
+        if msgId in pending_ids:
+            pending_ids.discard(msgId)
+            print("Removed msgId:", msgId, "from pending_ids. Remaining:", len(pending_ids))
+        else:
+            print("WARNING: msgId:", msgId, "not in pending_ids!")
+        
+        # Clear retry count on success
+        if msgId in msg_retry_count:
+            del msg_retry_count[msgId]
         
         b64_in = receivedMsg.get('Base64Message', '')
         b64_hash_in = receivedMsg.get('Base64MessageHash', '')
@@ -710,6 +745,7 @@ async def uart_reader_loop(recv_q, sreader):
                 colon_pos = s.find(':', ipd_start)
                 if colon_pos == -1:
                     # Wait for rest of frame
+                    print("Waiting for complete +IPD header (no colon yet)")
                     continue
                 header_body = s[ipd_start+5:colon_pos]  # after '+IPD,' up to ':'
                 # Two possible formats:
@@ -723,6 +759,7 @@ async def uart_reader_loop(recv_q, sreader):
                         length = int(parts[1])
                     except ValueError:
                         # malformed; wait for more data
+                        print("Malformed +IPD header (multi-link):", header_body)
                         continue
                 else:
                     # single-link
@@ -730,10 +767,13 @@ async def uart_reader_loop(recv_q, sreader):
                     try:
                         length = int(header_body)
                     except ValueError:
+                        print("Malformed +IPD header (single-link):", header_body)
                         continue
+                print("Parsed +IPD: ID=%d, length=%d" % (ID, length))
                 payload = s[colon_pos+1:]
                 # If payload shorter than declared length, await more UART data
                 if len(payload) < length:
+                    print("Incomplete payload: have %d bytes, need %d" % (len(payload), length))
                     continue
                 # Trim payload to declared length in case extra bytes follow
                 payload = payload[:length]
@@ -741,12 +781,16 @@ async def uart_reader_loop(recv_q, sreader):
                 json_close = payload.rfind('}')
                 if json_open == -1 or json_close == -1:
                     # Not JSON; ignore for now
+                    print("No JSON found in payload")
                     continue
                 json_text = payload[json_open:json_close+1]
                 try:
                     msg = ujson.loads(json_text)
+                    msg_id = msg.get('Id', '?')
+                    print("Successfully parsed JSON for msgId:", msg_id)
                 except Exception as ex:
                     print('JSON parse error:', ex)
+                    print('Failed JSON text (first 100):', json_text[:100])
                     continue
                 data_received_ok = True
                 await recv_q.put(msg)
@@ -754,6 +798,7 @@ async def uart_reader_loop(recv_q, sreader):
                 # Re-encode remaining part after processed frame boundary
                 remaining = s[colon_pos+1+length:]
                 buf = remaining.encode()
+                print("Frame processed, buffer remaining:", len(buf), "bytes")
             else:
                 # First, consume any CRLF-delimited lines for AT tokens and potential JSON
                 progressed = True
@@ -881,9 +926,19 @@ def buildTestMsg(msg_in):
     
     return msg_json, msgId
 
+# Flow control globals
+WINDOW_SIZE = 2  # max outstanding messages awaiting server ack (reduced for ESP-AT reliability)
+pending_ids = set()
+msg_send_times = {}  # {msgId: send_timestamp_ms}
+MSG_ACK_TIMEOUT_MS = 10000  # 10 seconds per message
+MAX_RETRIES = 2  # retry failed messages up to 2 times
+msg_retry_count = {}  # {msgId: retry_count}
+
 async def testMsgGenerator(msg_q, test_dict):
     print("testMsgGenerator start...")
     icounter = 1
+    total_sent = 0  # Track actual messages sent (not skipped)
+    start_time = time.ticks_ms()  # Record start time
 
     # Try to ensure transparent stream is ready if we intend to use it
     if TRANSPARENT_MODE[0] and not TRANSPARENT_READY[0]:
@@ -911,12 +966,16 @@ async def testMsgGenerator(msg_q, test_dict):
         # Send a batch of messages
         batch_end = min(icounter + BATCH_SIZE, iTestMsgCount + 1)
         for i in range(icounter, batch_end):
+            #if (i == 1):
+                #continue
+            
             msg = ("Hello World !!! %d\r\n" % i) * testMsgLength
             msg_json, msgId = buildTestMsg(msg)
             
             await msg_q.put((msgId, msg_json))
             test_dict[msgId] = msg_json
             batch_processed[batch_num][msgId] = False  # Track this message in the batch
+            total_sent += 1  # Count actually sent messages
             
             await asyncio.sleep_ms(50)  # Small delay between messages in same batch
         
@@ -927,7 +986,8 @@ async def testMsgGenerator(msg_q, test_dict):
             await asyncio.wait_for(batch_complete_events[batch_num].wait(), 30)  # 30 second timeout
             print("Batch %d complete" % batch_num)
         except asyncio.TimeoutError:
-            print("Batch %d timeout! Some messages may not have been processed." % batch_num)
+            missing = [mid for mid, done in batch_processed[batch_num].items() if not done]
+            print("Batch %d timeout! Missing acks for: %s" % (batch_num, missing))
         
         # Clean up this batch's tracking data
         del batch_complete_events[batch_num]
@@ -941,7 +1001,70 @@ async def testMsgGenerator(msg_q, test_dict):
             await asyncio.sleep_ms(1000)
             batch_num += 1
         else:
-            print("All %d messages queued and processed" % iTestMsgCount)
+            end_time = time.ticks_ms()
+            duration_ms = time.ticks_diff(end_time, start_time)
+            duration_sec = duration_ms / 1000.0
+            print("All %d messages queued and processed (target was %d) in %.2f seconds" % (total_sent, iTestMsgCount, duration_sec))
+
+# -----------------------------
+# Message timeout monitor (retry unacknowledged messages)
+# -----------------------------
+async def message_timeout_monitor(msg_q, test_dict):
+    """Monitor pending messages and retry those that timeout without acknowledgment."""
+    global pending_ids, msg_send_times, msg_retry_count
+    print("Message timeout monitor started")
+    
+    while True:
+        try:
+            await asyncio.sleep_ms(1000)  # Check every second
+            
+            now = time.ticks_ms()
+            timed_out = []
+            
+            # Check each pending message for timeout
+            for msgId in list(pending_ids):
+                if msgId in msg_send_times:
+                    age_ms = time.ticks_diff(now, msg_send_times[msgId])
+                    if age_ms > MSG_ACK_TIMEOUT_MS:
+                        timed_out.append(msgId)
+            
+            # Handle timed out messages
+            for msgId in timed_out:
+                retry_count = msg_retry_count.get(msgId, 0)
+                
+                if retry_count < MAX_RETRIES:
+                    print("TIMEOUT: msgId:", msgId, "no ack after", MSG_ACK_TIMEOUT_MS, "ms - retrying")
+                    # Remove from pending and send times
+                    pending_ids.discard(msgId)
+                    if msgId in msg_send_times:
+                        del msg_send_times[msgId]
+                    
+                    # Increment retry count
+                    msg_retry_count[msgId] = retry_count + 1
+                    
+                    # Re-queue the message
+                    if msgId in test_dict:
+                        payload = test_dict[msgId]
+                        await msg_q.put((msgId, payload))
+                        print("Re-queued msgId:", msgId, "for retry", msg_retry_count[msgId])
+                    else:
+                        print("ERROR: Cannot retry msgId:", msgId, "- not in test_dict")
+                else:
+                    print("FAILED: msgId:", msgId, "exceeded max retries (", MAX_RETRIES, ")")
+                    # Remove from tracking
+                    pending_ids.discard(msgId)
+                    if msgId in msg_send_times:
+                        del msg_send_times[msgId]
+                    if msgId in msg_retry_count:
+                        del msg_retry_count[msgId]
+            
+            # Periodic status report if there are pending messages
+            if len(pending_ids) > 0:
+                print("Status: %d pending messages:" % len(pending_ids), list(pending_ids)[:10])  # Show first 10
+                
+        except Exception as ex:
+            print("message_timeout_monitor error:", ex)
+            await asyncio.sleep_ms(1000)
 
 # -----------------------------
 # Watchdog (optional hard reset)
@@ -1143,8 +1266,9 @@ async def main():
     asyncio.create_task(sender(send_q, swriter))
     asyncio.create_task(uart_reader_loop(recv_q, sreader))
     asyncio.create_task(msgCompare(recv_q, test_dict))    
+    asyncio.create_task(message_timeout_monitor(send_q, test_dict))
     asyncio.create_task(link_watchdog(IP, PORT))
-    asyncio.create_task(showMemUsage())    
+#    asyncio.create_task(showMemUsage())    
 
     # Keep the loop alive
     while True:

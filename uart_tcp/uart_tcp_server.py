@@ -263,7 +263,8 @@ async def handle_json(obj):
     
 async def readline(sreader, limit=1024):
     """Minimal readline() for MicroPython StreamReader.
-       Returns bytes up to and including b'\\n' or until limit reached."""
+       Returns bytes up to and including b'\\n' or until limit reached.
+       Special handling: if '>' is detected, return immediately to signal prompt."""
     buf = bytearray()
     
     while True:
@@ -274,9 +275,10 @@ async def readline(sreader, limit=1024):
             return bytes(buf)
         
         buf += ch
-        # Special case: ESP-AT data prompt '>' does not end with newline.
-        # Return immediately so token dispatch can see it and unblock send_at().
-        if ch == b'>' and len(buf) == 1:
+        
+        # Special case: ESP-AT data prompt '>' can appear standalone or after OK
+        # Return immediately when we see it to minimize latency
+        if ch == b'>':
             return bytes(buf)
 
         if ch == b'\n' or len(buf) >= limit:
@@ -338,6 +340,9 @@ async def json_line_reader_stream(
             s = s.lstrip()
             return s.startswith('{') or s.startswith('[')
 
+    # Accumulation buffer for incomplete +IPD frames - PERSISTS across all iterations
+    ipd_buffer = ''
+
     while True:
         line = await readline(sreader)
 
@@ -353,7 +358,10 @@ async def json_line_reader_stream(
             # if you want to observe oversized lines.
             continue
 
-        # Trim LF then optional CR
+        # Save original line with CRLF before stripping (needed for proper +IPD accumulation)
+        original_line = line
+        
+        # Trim LF then optional CR for token checking
         if line.endswith(b'\n'):
             line = line[:-1]
             
@@ -370,90 +378,141 @@ async def json_line_reader_stream(
             # Fallback: best-effort replacement chars
             text = line.decode(encoding, 'ignore')
 
-        idx = text.find("+IPD")
+        # Check for AT response tokens FIRST, regardless of +IPD presence
+        # This ensures we don't miss '>' or 'SEND OK' when interleaved with data
+        if b'OK' in line:
+            _maybe_set('OK')
+        if b'>' in line:
+            print('DEBUG: Signaling > token from line:', line[:50])
+            _maybe_set('>')
+        if b'ERROR' in line:
+            _maybe_set('ERROR')
+        if b'FAIL' in line:
+            _maybe_set('FAIL')
+        if b'ALREADY CONNECTED' in line:
+            _maybe_set('ALREADY CONNECTED')
+        if b'SEND OK' in line:
+            _maybe_set('SEND OK')
 
-        # process data packet
-        if idx != -1:
-#            print("Raw data length: " + str(len(text)))            
- #           print("Raw data...")
-  #          print(text)
-
-            chunks = text.split("+IPD")
-
-            for chunk in chunks:
-                chunk = chunk.strip()
+        # Determine if this line should be accumulated for +IPD processing
+        # We need to filter out ALL AT responses and status messages
+        # Only accumulate pure +IPD frames or their continuation data
+        is_at_response = (
+            b'OK' in line or 
+            b'>' in line or 
+            b'ERROR' in line or 
+            b'FAIL' in line or 
+            b'SEND' in line or  # Catches both 'SEND OK' and 'Recv X bytes'
+            b'CONNECT' in line or
+            b'CLOSED' in line or
+            b'WIFI' in line or
+            b'+CIFSR' in line or
+            b'Recv' in line or  # ESP-AT specific feedback
+            b'busy' in line or  # ESP-AT busy status
+            (len(line) <= 2 and line.strip() in (b'', b' ', b'>'))  # Single char/whitespace
+        )
+        
+        # Always accumulate ORIGINAL line (with CRLF) for +IPD frames
+        # This preserves the exact byte count declared in the +IPD header
+        if '+IPD' in text:
+            # New frame starts - decode original line to preserve CRLF in buffer
+            try:
+                ipd_buffer += original_line.decode(encoding)
+            except:
+                ipd_buffer += original_line.decode(encoding, 'ignore')
+        elif ipd_buffer and not is_at_response:
+            # Continue accumulating if we have pending data AND this isn't an AT response
+            try:
+                ipd_buffer += original_line.decode(encoding)
+            except:
+                ipd_buffer += original_line.decode(encoding, 'ignore')
+        
+        # Try to extract complete frames from buffer whenever we have data
+        if ipd_buffer:
+            while '+IPD,' in ipd_buffer:
+                ipd_start = ipd_buffer.find('+IPD,')
+                colon_pos = ipd_buffer.find(':', ipd_start)
                 
-                if not chunk:
-                    continue
-
-                # parse link id and payload
-                # expected format: "+IPD,<id>,<len>:<payload>"
-                # after split, chunk starts with ",<id>,<len>:..." or full header
-                # normalize to ensure parsing works
-                if not chunk.startswith(",") and not chunk.startswith("+IPD"):
-                    # ensure we have a leading comma before id
-                    pass
-
-                # find separators
+                if colon_pos == -1:
+                    # Need more data for header
+                    print(f'DEBUG: Waiting for complete header, buffer len={len(ipd_buffer)}')
+                    break
+                
+                header = ipd_buffer[ipd_start+5:colon_pos]  # between '+IPD,' and ':'
+                
                 try:
-                    # find first comma after optional prefix
-                    p_id_start = chunk.find(",")
-                    if p_id_start == -1:
+                    # Parse header: <link_id>,<len>
+                    parts = header.split(',')
+                    if len(parts) != 2:
+                        print('DEBUG: Malformed +IPD header:', header)
+                        # Skip this frame by removing up to colon
+                        ipd_buffer = ipd_buffer[colon_pos+1:]
                         continue
-                    p_id_end = chunk.find(",", p_id_start + 1)
-                    if p_id_end == -1:
-                        continue
-                    p_len_end = chunk.find(":", p_id_end + 1)
-                    if p_len_end == -1:
-                        continue
-                    link_id_str = chunk[p_id_start+1:p_id_end]
-                    link_id = int(link_id_str)
-                    print(f'DEBUG: Received +IPD with link_id={link_id}')
-                    # payload begins after ':'
-                    payload_str = chunk[p_len_end+1:]
-                except Exception:
-                    continue
-
-                # find start of JSON
-                idx = payload_str.find("{")
-                
-                if idx == -1:
-                    continue
-
-                json_str = payload_str[idx:]
-
-                # Decide JSON vs text
-                if json_predicate(json_str):
-                    try:
-                        msg = json.loads(json_str)
-                        # include link_id so responders can reply to same connection
-                        await recv_q.put((link_id, msg))                                                    
-                        continue
-                    except Exception:
-                        # Fall through to on_text if parse fails
-                        pass
-
-        # Non-JSON or JSON parse failed
-        else:
+                    
+                    link_id = int(parts[0])
+                    declared_len = int(parts[1])
+                    
+                    # Check if we have full payload
+                    payload_start = colon_pos + 1
+                    payload_end = payload_start + declared_len
+                    
+                    if len(ipd_buffer) < payload_end:
+                        # Incomplete; wait for more data
+                        have = len(ipd_buffer) - payload_start
+                        print(f'DEBUG: Incomplete +IPD frame link={link_id} len={declared_len}: have {have} need {declared_len}')
+                        break  # Keep buffer intact, wait for next readline
+                    
+                    # We have enough data in buffer based on declared length
+                    print(f'DEBUG: Complete frame! link={link_id} len={declared_len}')
+                    print(f'DEBUG: Buffer positions: ipd_start={ipd_start} colon={colon_pos} pay_start={payload_start} pay_end={payload_end} buf_len={len(ipd_buffer)}')
+                    print(f'DEBUG: Full buffer (first 250): {repr(ipd_buffer[:250])}')
+                    
+                    # Check if next frame starts BEFORE the declared payload end
+                    # This indicates the current frame is corrupted/truncated
+                    next_frame_pos = ipd_buffer.find('\r\n+IPD,', payload_start)
+                    
+                    if next_frame_pos != -1 and next_frame_pos < payload_end - 2:
+                        # Next frame starts before expected end (with margin for the terminating \r\n)
+                        # This frame is corrupted - skip it and move to next frame
+                        print(f'DEBUG: CORRUPT frame detected - next frame at {next_frame_pos}, expected end at {payload_end}')
+                        print(f'DEBUG: Skipping corrupted frame and moving to next')
+                        # Remove everything up to the next frame marker (skip the corrupted frame)
+                        ipd_buffer = ipd_buffer[next_frame_pos + 2:]  # +2 to skip \r\n
+                        continue  # Skip to next iteration to process the next frame
+                    
+                    # Normal case: extract full declared length
+                    payload_str = ipd_buffer[payload_start:payload_end]
+                    ipd_buffer = ipd_buffer[payload_end:]
+                    
+                    print(f'DEBUG: Extracted payload len={len(payload_str)}, first 50: {repr(payload_str[:50])}')
+                    print(f'DEBUG: Extracted payload last 50: {repr(payload_str[-50:])}')
+                    print(f'DEBUG: Remaining buffer after extraction: {repr(ipd_buffer[:50])}')
+                    
+                    # The payload is the JSON + CRLF (total = declared_len)
+                    # Strip CRLF from the end
+                    json_str = payload_str.rstrip('\r\n')
+                    
+                    if json_predicate(json_str):
+                        try:
+                            msg = json.loads(json_str)
+                            mid = msg.get('Id')
+                            print(f'DEBUG: Queueing msg Id={mid} from link={link_id}')
+                            await recv_q.put((link_id, msg))
+                        except Exception as ex:
+                            print('DEBUG: JSON parse error:', ex)
+                            print('DEBUG: Payload length:', len(payload_str))
+                            print('DEBUG: JSON string length:', len(json_str))
+                            print('DEBUG: Failed JSON (first 100):', repr(json_str[:100]))
+                            print('DEBUG: Failed JSON (last 50):', repr(json_str[-50:]))
+                            
+                except Exception as ex:
+                    print('DEBUG: +IPD frame parse error:', ex)
+                    # Skip malformed frame
+                    ipd_buffer = ipd_buffer[colon_pos+1:] if colon_pos != -1 else ''
+        
+        # Print non-+IPD lines for debugging
+        if not '+IPD' in text and not ipd_buffer:
             print('[UART]', line)
-
-            if b'OK' in line:
-                _maybe_set('OK')
-                
-            if b'>' in line:
-                _maybe_set('>')
-                
-            if b'ERROR' in line:
-                _maybe_set('ERROR')
-                
-            if b'FAIL' in line:
-                _maybe_set('FAIL')
-                
-            if b'ALREADY CONNECTED' in line:
-                _maybe_set('ALREADY CONNECTED')
-
-            if b'SEND OK' in line:
-                _maybe_set('SEND OK')
 
 # -------------- Example "sender" (raw TCP writes) --------------
 # You will still need to wrap messages with CIPSend/CIPSENDEX for a specific connection id.
@@ -479,6 +538,8 @@ async def sender_loop(send_q):
             payload = data if isinstance(data, (bytes, bytearray)) else data.encode('utf-8')
             payload += b'\r\n'
 
+            queue_depth = send_q.qsize() if hasattr(send_q, 'qsize') else 'NA'
+            print(f'DEBUG: send_q depth before send: {queue_depth}')
             cmd = f'AT+CIPSEND={link_id},{len(payload)}'
             print(f'DEBUG: AT command: {cmd}')
             # expect prompt '>' for data send
@@ -493,6 +554,8 @@ async def sender_loop(send_q):
                 print(f'DEBUG: SEND OK received: {send_ok}')
                 if send_ok:
                     print('Msg sent OK...')
+                    # Increased pacing delay to reduce burst interleaving and ESP-AT corruption
+                    await asyncio.sleep_ms(50)
                 else:
                     print('Msg sent but no SEND OK token')
             else:
@@ -501,9 +564,14 @@ async def sender_loop(send_q):
             print('sender_loop error:', ex)
 
 # -------------- Simple dispatcher for +IPD lines --------------
+# Message processing counters
+recv_count = [0]
+send_count = [0]
+
 async def recv_queue_processor(recv_q, send_q):
     while True:
         link_id, msg = await recv_q.get()
+        recv_count[0] += 1
         
         category = msg["Category"]        
 
@@ -513,6 +581,11 @@ async def recv_queue_processor(recv_q, send_q):
             await handle_test(link_id, msg, send_q)
         else:
             print('RX:', msg)
+        
+        # Periodic garbage collection to reduce fragmentation
+        if recv_count[0] % 3 == 0:
+            gc.collect()
+            print(f'DEBUG: GC after {recv_count[0]} msgs; free={gc.mem_free()}')
 
 # -------- Concrete Handlers (ported) --------
 # Files: 3-step protocol: Header -> Content -> End
@@ -604,6 +677,8 @@ async def handle_test(link_id, msg, send_queue):
         }
         
         await send_queue.put((link_id, ujson.dumps(rsp)))
+        send_count[0] += 1
+        print(f'DEBUG: Queued response for Id={msg_id}; recv={recv_count[0]} send={send_count[0]}')
     except Exception as ex:
         error_q.append('Test handler error: %s' % ex)
 
