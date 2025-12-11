@@ -159,9 +159,10 @@ def main():
 
     print("\nDistributing shared queue across producers...")
 
-    # Track how many words each producer receives and each consumer outputs for verification.
+    # Track per-producer assignments and per-consumer receipts for stats, plus global receipt order.
     assigned_words = [[] for _ in range(entityCount)]
     received_words = [[] for _ in range(entityCount)]
+    global_received = []
 
     # Prime TX FIFOs up to their depth.
     queue_idx = 0
@@ -185,10 +186,12 @@ def main():
     while queue_idx < len(shared_words):
         time.sleep(0.002)
 
-        # Drain consumer RX to avoid overflows.
+        # Drain consumer RX to avoid overflows and record global order.
         for i in range(entityCount):
             while consumers[i].rx_fifo():
-                received_words[i].append(consumers[i].get())
+                word = consumers[i].get()
+                received_words[i].append(word)
+                global_received.append(word)
 
         # Fill producers with any available FIFO space.
         for i in range(entityCount):
@@ -210,7 +213,9 @@ def main():
     # Final RX drain.
     for i in range(entityCount):
         while consumers[i].rx_fifo():
-            received_words[i].append(consumers[i].get())
+            word = consumers[i].get()
+            received_words[i].append(word)
+            global_received.append(word)
 
     # --- Verification ---
     print("\nVerifying shared queue delivery...")
@@ -245,17 +250,16 @@ def main():
         else:
             print(f"Consumer {i}: received {len(actual)} words OK")
 
-    if all_correct and total_assigned == len(shared_words) and total_received == len(shared_words):
-        reconstructed = []
-        for chunk in assigned_words:
-            reconstructed.extend(chunk)
-        rebuilt = words_to_string(reconstructed, shared_len)
-        if rebuilt == shared_string:
-            print("Shared queue delivered intact.")
-        else:
-            print("Warning: reconstructed string mismatch despite word match.")
+    if total_received != len(shared_words):
+        print("Shared queue delivery had errors (global count mismatch).")
+        all_correct = False
     else:
-        print("Shared queue delivery had errors.")
+        # Global order check against the original queue
+        order_match = global_received == shared_words
+        if order_match:
+            print("Shared queue delivered intact in original order.")
+        else:
+            print("Shared queue delivered with reordering (data intact per-word).")
 
     # --- Cleanup ---
     for sm in producers + consumers:
