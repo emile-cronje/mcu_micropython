@@ -2,13 +2,22 @@ import time
 from machine import Pin
 from rp2 import PIO, StateMachine, asm_pio
 
-# Attempt 8: Use a single PIO instance.
-# The failure of all previous clocked attempts suggests an obscure issue,
-# possibly related to interactions between PIO0 and PIO1.
-# This version places all state machines on a single PIO block (PIO0)
-# as a diagnostic step. This limits us to 2 pairs instead of 4.
+# Make the state-machine count configurable. Pico 2 exposes 12 SM (3 PIO blocks × 4 SM).
+# MicroPython maps state machine IDs sequentially across PIO blocks (0-3 => PIO0, 4-7 => PIO1, 8-11 => PIO2).
+MAX_STATE_MACHINES = 12
+STATE_MACHINES_REQUESTED = 12  # Set this to any even number up to 12
+multiple = 25
 
-entityCount = 4  # Number of producer/consumer pairs (each pair uses 2 state machines)
+
+def resolve_counts():
+    sm = min(STATE_MACHINES_REQUESTED, MAX_STATE_MACHINES)
+    if sm % 2:
+        print(f"Warning: requested {STATE_MACHINES_REQUESTED} SM is odd; rounding down to {sm-1}.")
+        sm -= 1
+    if sm < 2:
+        raise ValueError("Need at least 2 state machines (1 producer/consumer pair)")
+    pairs = sm // 2
+    return sm, pairs
 
 @asm_pio(
     out_shiftdir=PIO.SHIFT_LEFT,
@@ -70,7 +79,8 @@ def create_consumer_pio(clock_pin_id):
 
 
 def main():
-    print("Init complete...")
+    sm_count, entityCount = resolve_counts()
+    print(f"Init complete... using {sm_count} state machines -> {entityCount} producer/consumer pairs")
     pio_freq = 20000
 
     # Initialize clock pins to LOW before setting up state machines
@@ -85,19 +95,21 @@ def main():
     consumers = []
 
     # --- Setup Producer/Consumer Pairs ---
-    # Each pair uses two state machines. RP2040 has 8 SM total (0-7). Limit pairs to 4.
+    # Each pair uses two state machines. Pico 2 has 12 SM total (3 PIO blocks × 4 SM), so we can run 6 pairs.
     if entityCount < 1:
         raise ValueError("entityCount must be >= 1")
-    if entityCount > 4:
-        raise ValueError("entityCount too large: max 4 pairs (8 state machines)")
+    max_pairs = 6  # 12 state machines / 2 per pair
+    if entityCount > max_pairs:
+        raise ValueError(f"entityCount too large: max {max_pairs} pairs (12 state machines)")
 
     for i in range(entityCount):
         data_pin_id = i * 2
         clock_pin_id = i * 2 + 1
         producer_sm_id = i * 2
         consumer_sm_id = i * 2 + 1
-        
-        print(f"Setting up pair {i} on PIO(0):")
+        pio_index = producer_sm_id // 4  # For logging only; mapping is automatic in MicroPython
+
+        print(f"Setting up pair {i} on PIO({pio_index}):")
         print(f"  Producer on SM{producer_sm_id} (Data: GP{data_pin_id}, Clock: GP{clock_pin_id})")
         print(f"  Consumer on SM{consumer_sm_id} (Data: GP{data_pin_id}, Clock: GP{clock_pin_id})")
 
@@ -120,18 +132,19 @@ def main():
         ))
 
     # --- Main Operation ---
-    # Test with both raw data and strings
-    test_strings = [
-        "Hello PIO World!123456"*40,
-        "Testing 1 2 3...5734567567356735"*40,
-        "Hello PIO World!gadjghladfjghladjg"*40,
-        "Testing 1 2 3...34879a87098"*40
+    # Build per-pair test payloads; extend base patterns if we have more pairs than templates.
+    base_strings = [
+        "Hello PIO World!123456",
+        "Testing 1 2 3...5734567567356735",
+        "Hello PIO World!gadjghladfjghladjg",
+        "Testing 1 2 3...34879a87098",
     ]
 
-    # Only use as many strings as we have pairs
-    if len(test_strings) > entityCount:
-        print(f"Warning: {len(test_strings)} test strings provided but only {entityCount} pairs configured. Truncating.")
-        test_strings = test_strings[:entityCount]
+    test_strings = []
+    for i in range(entityCount):
+        base = base_strings[i % len(base_strings)]
+        decorated = f"{base} [pair {i}]"
+        test_strings.append(decorated * multiple)
     
     # Convert strings to 32-bit words
     def string_to_words(s):
@@ -181,6 +194,7 @@ def main():
         for i in range(entityCount):
             initial_count = min(FIFO_DEPTH, len(test_data[i]))
             print(f"Producer {i} pre-loading {initial_count} words:")
+            
             for j in range(initial_count):
                 producers[i].put(test_data[i][j])
                 print(f"  - {hex(test_data[i][j])}")
