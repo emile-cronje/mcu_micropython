@@ -50,9 +50,10 @@ IP   = "192.168.10.250"  # your TCP server IP
 PORT = 8080             # your TCP server port
 
 # Test generator settings
-iTestMsgCount = 50
+iTestMsgCount = 100
 testMsgLength = 1
 BATCH_SIZE = 25
+
 # Rate control config
 BYTES_PER_SEC      = 2048   # throttle raw throughput (0 = unlimited)
 MSG_PER_SEC        = 10     # throttle number of messages/ATs (0 = unlimited)

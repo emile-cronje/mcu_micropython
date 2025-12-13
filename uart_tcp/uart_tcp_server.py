@@ -12,6 +12,51 @@ import ubinascii, uhashlib, os
 import json
 import re
 
+# SHA256 simple - matches the C implementation in main.c
+def sha256_simple(input_data):
+    """
+    Simplified *custom checksum* implementation (matches C version).
+    Returns Base64-encoded 32-byte hash using ubinascii.
+    
+    NOTE: This is NOT the standard cryptographic SHA256 algorithm.
+    """
+    if isinstance(input_data, str):
+        # MicroPython uses 'utf8' or 'utf-8'
+        input_data = input_data.encode('utf8')
+    
+    input_len = len(input_data)
+    # Use standard uctypes or struct module for C-like 32-bit operations 
+    # or ensure Python's default large integers don't cause issues.
+    # & 0xFFFFFFFF ensures 32-bit wrap-around behavior.
+    sum_val = 0x5A5A5A5A & 0xFFFFFFFF 
+    
+    # --- Custom Checksum Logic ---
+    
+    # Mix all input bytes
+    for i in range(input_len):
+        sum_val = (((sum_val << 5) + sum_val) + input_data[i]) & 0xFFFFFFFF
+        sum_val = (sum_val ^ (sum_val >> 16)) & 0xFFFFFFFF
+    
+    # Generate 32 bytes of "hash" from the checksum
+    hash_bytes = bytearray(32)
+    for i in range(32):
+        hash_bytes[i] = (sum_val >> ((i % 4) * 8)) & 0xFF
+        if i % 4 == 3:
+            # Note: This line uses 'input_data[i % input_len]' which can cause an 
+            # IndexError if i > input_len, but the custom logic seems to rely on this.
+            sum_val = (((sum_val << 7) ^ (sum_val >> 11)) + input_data[i % input_len]) & 0xFFFFFFFF
+            
+    # --- Base64 Encoding Fix ---
+    
+    # Base64 encode the hash using ubinascii.b2a_base64
+    # ubinascii.b2a_base64 returns bytes which usually includes a trailing newline.
+    b64_encoded_bytes = ubinascii.b2a_base64(hash_bytes)
+    
+    # Decode the resulting bytes to a string and strip the trailing newline (\n)
+    return b64_encoded_bytes.decode('utf8').strip()
+
+# Example Usage:
+# print(sha256_simple("hello world"))
 SSID = 'Cudy24G'         # <-- change if needed
 PASSWORD = 'ZAnne19991214'
 PORT = '8080'
@@ -643,36 +688,37 @@ async def handle_test(link_id, msg, send_queue):
     print('Test Category...')
     
     try:
-        _md = uhashlib.sha256()
         msg_id = msg.get('Id')
         b64_in = msg.get('Base64Message', '')
         b64_hash_in = msg.get('Base64MessageHash', '')
+        
+        # Decode Base64 message and hash
         clear = ubinascii.a2b_base64(b64_in) if isinstance(b64_in, str) else b64_in
-        clear_hash_in = ubinascii.a2b_base64(b64_hash_in) if isinstance(b64_hash_in, str) else b64_hash_in
-
-        _md.update(clear)
-        calc = _md.digest()
-
-        if calc != clear_hash_in:
+        
+        # Compute hash using sha256_simple (matches C implementation)
+        calc_hash = sha256_simple(clear)
+        #calc_hash = 'aa'
+        
+        # Compare hashes
+        if calc_hash != b64_hash_in:
             err = 'test msg hash diff'
             print(err)
             print('b64_in: ' + str(b64_in))
-            print('b64_hash_in: ' + str(b64_hash_in))                        
+            print('b64_hash_in (received): ' + str(b64_hash_in))
+            print('b64_hash_in (calculated): ' + str(calc_hash))
             error_q.append(err)
         else:
-            print("Matched OK: " + str(clear))
-
-        _md2 = uhashlib.sha256()
-        _md2.update(clear)
-        rsp_hash = _md2.digest()
+            print("Hash Matched OK: " + str(clear))
+        
+        # Generate response with same hash function
+        rsp_hash = sha256_simple(clear)
         b64_rsp = ubinascii.b2a_base64(clear)[:-1].decode('utf-8')
-        b64_rsp_hash = ubinascii.b2a_base64(rsp_hash)[:-1].decode('utf-8')
-
+        
         rsp = {
             'Id': msg_id,
             'Category': 'Test',
             'Base64Message': b64_rsp,
-            'Base64MessageHash': b64_rsp_hash,
+            'Base64MessageHash': rsp_hash,
             'RspReceivedOK': True,
         }
         
@@ -710,7 +756,7 @@ async def main():
     sender_task = asyncio.create_task(sender_loop(send_q))
     queue_processor_task = asyncio.create_task(recv_queue_processor(recv_q, send_q))
     asyncio.create_task(heartbeat())
-    asyncio.create_task(showMemUsage())        
+#    asyncio.create_task(showMemUsage())        
 
     useStaticIP = True
     
