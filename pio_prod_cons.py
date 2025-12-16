@@ -5,7 +5,7 @@ from rp2 import PIO, StateMachine, asm_pio
 # Make the state-machine count configurable. Pico 2 exposes 12 SM (3 PIO blocks × 4 SM).
 # MicroPython maps state machine IDs sequentially across PIO blocks (0-3 => PIO0, 4-7 => PIO1, 8-11 => PIO2).
 MAX_STATE_MACHINES = 12
-STATE_MACHINES_REQUESTED = 12  # Set this to any even number up to 12
+STATE_MACHINES_REQUESTED = 8  # Set this to any even number up to 12
 multiple = 50
 PIO_FREQ_BASE = 20000
 
