@@ -54,11 +54,8 @@ class BTreeNode:
         """Get actual number of children"""
         if self.is_leaf:
             return 0
-        count = 0
-        for child in self.children:
-            if child is not None:
-                count += 1
-        return count
+        # Internal node with n keys has exactly n+1 children
+        return self.key_count + 1
 
     def get_child(self, idx):
         """Safe child access"""
@@ -270,11 +267,8 @@ class BTree:
             # Find child with binary search
             idx = bisect_left(node.keys[:node.key_count], key)
             
-            # Handle edge case where key equals node key
-            if idx < node.key_count and node.keys[idx] == key:
-                # For range searches, could return value from internal node
-                # For now, continue to leaf
-                pass
+            # Ensure idx is within bounds
+            idx = min(idx, node.get_child_count() - 1)
             
             child = node.children[idx]
             if child:
@@ -398,19 +392,18 @@ class BTree:
                 return True
             return False
         else:
-            # Find child containing key
+            # Internal node - find which child may contain the key
             idx = bisect_left(node.keys[:node.key_count], key)
             
-            if idx < node.key_count and node.keys[idx] == key:
-                # Key is in internal node - handle later if needed
-                pass
+            # Ensure idx is within bounds
+            idx = min(idx, node.get_child_count() - 1)
             
-            # Ensure child has enough keys
             child = node.children[idx]
             if child and child.key_count < t:
                 self._fill(node, idx)
                 # Recalculate index after fill
                 idx = bisect_left(node.keys[:node.key_count], key)
+                idx = min(idx, node.get_child_count() - 1)
             
             child = node.children[idx]
             if child:
@@ -484,6 +477,10 @@ class BTree:
         """Merge child with its sibling"""
         child = node.children[idx]
         sibling = node.children[idx + 1]
+        
+        # Safety checks
+        if child is None or sibling is None:
+            return
 
         if child.is_leaf:
             # Merge leaf nodes
@@ -506,8 +503,9 @@ class BTree:
         node.key_count -= 1
 
         # Remove sibling from parent's children
-        for i in range(idx + 1, node.get_child_count() - 1):
+        for i in range(idx + 1, node.get_child_count()):
             node.children[i] = node.children[i + 1]
+        node.children[node.get_child_count()] = None  # Clear last position
         
         if self.use_pool:
             self.pool.release(sibling)
