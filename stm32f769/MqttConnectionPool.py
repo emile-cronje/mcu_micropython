@@ -18,3 +18,6 @@ class MqttConnectionPool:
         brokerIndex = random.randint(0, len(self.mqttBrokers) - 1)
         mqttClient = self.mqttConnectionPool[self.mqttBrokers[brokerIndex]]
         await mqttClient.publish(topic, message, qos = 1)            
+
+    def GetConnection(self, broker):
+        return self.mqttConnectionPool[broker]

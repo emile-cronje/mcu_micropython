@@ -1,12 +1,12 @@
 import os
 import json
-import utime
+#import utime
 import time
 #import btree_custom_mem
 from btree_custom_mem import BTree
 import gc
-import pyb
-from machine import SPI, Pin
+#import pyb
+#from machine import SPI, Pin
 from ramblock import RAMBlockDevExt
 import random
 from AdrHelper import AdrHelper
@@ -49,12 +49,7 @@ if (useRam == True):
 #    os.mount(bdev, rootDir)
  #   dir = rootDir + '/btree_storage'    
   #  os.mkdir(dir)
-else:
-    rootDir = '/sd'    
-    os.mount(sd, rootDir)
-    dir = rootDir + '/btree_storage'    
-    #os.mkdir(sdDir)
-
+  
 ramBefore = free(True)
 start = time.time()
 B = BTree(5)

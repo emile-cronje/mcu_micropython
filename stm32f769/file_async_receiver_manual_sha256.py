@@ -10,9 +10,7 @@ import time
 from machine import SPI, Pin
 from queue import Queue
 
-SERVER_1 = '192.168.10.174'
-SERVER_2 = '192.168.10.135'
-SERVER_3 = '192.168.10.124'
+SERVER_1 = '192.168.10.135'
 
 _error_q = {}
 _success_q = {}
@@ -23,6 +21,7 @@ backupDir = '/sd/backups_new'
 
 async def conn_han(client):
     await client.subscribe('rp6502_pub_1', 1)
+    await client.subscribe('rp6502_pub_2', 1)    
 
 def sha256_simple(input_data):
     """
@@ -241,7 +240,7 @@ async def monitorSendQueue(mqtt_clients, send_q):
         if (i % 2) == 0:
             await mqtt_clients[0].publish('rp6502_sub_1', msg, qos = 1)
         else:            
-            await mqtt_clients[0].publish('rp6502_sub_1', msg, qos = 1)
+            await mqtt_clients[0].publish('rp6502_sub_2', msg, qos = 1)
 
         print("Published to server 1:")
         print(str(msg))

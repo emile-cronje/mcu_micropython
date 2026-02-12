@@ -1,4 +1,5 @@
 import json
+import ujson
 import os
 import time
 import sys
@@ -17,6 +18,7 @@ from AssetTaskController import AssetTaskController
 from mqtt_as_latest import MQTTClient, config
 import uhashlib
 from ramblock import RAMBlockDevExt
+from queue import Queue
 
 useMem = True
 useRAMDisk = False
@@ -52,7 +54,7 @@ import pyb
 _treeDepth = 5
 CREDENTIALS = ('foo', 'bar')
 EXAMPLE_ASSETS_DIR = './example-assets/'
-MQTT_BROKERS = ['192.168.10.124', '192.168.10.135', '192.168.10.174']
+MQTT_BROKERS = ['192.168.10.124', '192.168.10.135']
 #MQTT_BROKERS = ['192.168.10.174']
 sdDir = "/sd"
 rbDir = "/rb"
@@ -686,14 +688,16 @@ async def monitorStatusQueues(success_q, error_q):
 #        print("Time..." + str(time.gmtime()))                
         await asyncio.sleep(3)
 
+
 async def main():
     loop = asyncio.get_event_loop()
+    
     loop.create_task(naw.run())
     loop.create_task(showMemUsage())
 
     loop.run_forever()
 
-naw = Nanoweb(8001)
+naw = Nanoweb(3002)
 naw.assets_extensions += ('ico',)
 naw.STATIC_DIR = EXAMPLE_ASSETS_DIR
 
@@ -726,7 +730,8 @@ if (useMem == False):
         os.mount(pyb.SDCard(), rootDir)    
 
 asyncio.run(Init(dir))
-asyncio.run(main())    
+asyncio.run(main())
+
 
 
     
